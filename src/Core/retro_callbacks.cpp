@@ -145,9 +145,6 @@ int16_t keyboard_left_analog_state(unsigned index, unsigned id)
 void input_poll_cb()
 {
     retro_frontend_context().input.poll();
-    if (retro_frontend_context().input.quit_requested()) {
-        retro_frontend_context().quit = true;
-    }
 }
 
 // Returns Libretro input state, including keyboard-to-analog helpers for N64.

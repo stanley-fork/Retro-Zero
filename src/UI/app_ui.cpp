@@ -11,6 +11,7 @@ LV_FONT_DECLARE(lv_font_montserrat_16)
 #include "rom_browser.h"
 #include "../Core/core_registry.h"
 #include "../Core/core_downloader.h"
+#include "../Input/escape_hold.h"
 #include "../Upload/rom_upload_server.h"
 #include "console_art_renderer.h"
 #include "../Utils/file_utils.h"
@@ -22,6 +23,7 @@ LV_FONT_DECLARE(lv_font_montserrat_16)
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -93,6 +95,13 @@ std::string g_selected_rom;
 std::vector<FileEntry> g_files;
 std::vector<int> g_input_fds;
 
+struct FilePickerState {
+    std::string directory;
+    std::string filter;
+    int index;
+};
+std::vector<FilePickerState> g_file_history;
+
 lv_obj_t *g_root = nullptr;
 lv_obj_t *g_time_label = nullptr;
 lv_obj_t *g_power_bar = nullptr;
@@ -105,6 +114,8 @@ lv_obj_t *g_count_label = nullptr;
 lv_obj_t *g_file_list = nullptr;
 lv_obj_t *g_no_results_box = nullptr;
 lv_obj_t *g_error_overlay = nullptr;
+lv_obj_t *g_exit_hold_overlay = nullptr;
+lv_obj_t *g_exit_hold_bar = nullptr;
 lv_obj_t *g_core_prompt_overlay = nullptr;
 lv_obj_t *g_core_prompt_left = nullptr;
 lv_obj_t *g_core_prompt_right = nullptr;
@@ -122,6 +133,8 @@ AppConfig g_app_config;
 
 constexpr uint32_t kNavHoldDelayMs = 220;
 constexpr uint32_t kNavHoldRepeatMs = 65;
+constexpr uint32_t kExitHoldMs = 3000;
+EscapeHold g_escape_hold;
 std::array<uint8_t, KEY_MAX + 1> g_nav_key_down {};
 std::array<uint32_t, KEY_MAX + 1> g_nav_key_next_ms {};
 
@@ -266,11 +279,11 @@ void render_settings_rows()
 
     if (g_filter_label) {
         if (g_capture_bind_index >= 0) {
-            lv_label_set_text(g_filter_label, "Press a key to bind, BACKSPACE to cancel");
+            lv_label_set_text(g_filter_label, "Press a key to bind, ESC to cancel");
         } else if (g_settings_page == SettingsPage::Main) {
-            lv_label_set_text(g_filter_label, "Use Left/Right to adjust values");
+            lv_label_set_text(g_filter_label, "Left/Right: adjust | ESC: back");
         } else {
-            lv_label_set_text(g_filter_label, "Enter to rebind selected action");
+            lv_label_set_text(g_filter_label, "Enter: rebind | ESC: back");
         }
     }
 }
@@ -677,8 +690,66 @@ void show_settings_reset_prompt()
     lv_obj_move_foreground(g_core_prompt_overlay);
 }
 
+void cancel_exit_hold()
+{
+    g_escape_hold.cancel();
+    if (g_exit_hold_overlay) lv_obj_del(g_exit_hold_overlay);
+    g_exit_hold_overlay = nullptr;
+    g_exit_hold_bar = nullptr;
+}
+
+bool can_exit_from_root()
+{
+    return g_view == View::ConsolePicker && !g_core_prompt_overlay &&
+           !g_error_overlay && !g_launching;
+}
+
+void update_exit_hold()
+{
+    if (!g_escape_hold.active() || !can_exit_from_root()) {
+        cancel_exit_hold();
+        return;
+    }
+
+    const uint32_t elapsed = g_escape_hold.elapsed(lv_tick_get());
+    if (!g_exit_hold_overlay) {
+        g_exit_hold_overlay = lv_obj_create(g_root);
+        lv_obj_set_size(g_exit_hold_overlay, 300, 96);
+        lv_obj_center(g_exit_hold_overlay);
+        lv_obj_clear_flag(g_exit_hold_overlay, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_radius(g_exit_hold_overlay, 8, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(g_exit_hold_overlay, lv_color_hex(0x121212), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(g_exit_hold_overlay, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_color(g_exit_hold_overlay, lv_color_hex(0x555555), LV_PART_MAIN);
+        lv_obj_set_style_border_width(g_exit_hold_overlay, 1, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(g_exit_hold_overlay, 8, LV_PART_MAIN);
+
+        lv_obj_t *label = lv_label_create(g_exit_hold_overlay);
+        lv_label_set_text(label, "Hold ESC 3s to return home");
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(label, lv_color_hex(0xEAF0FF), LV_PART_MAIN);
+        lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 8);
+
+        label = lv_label_create(g_exit_hold_overlay);
+        lv_label_set_text(label, "Release to cancel");
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_10, LV_PART_MAIN);
+        lv_obj_set_style_text_color(label, lv_color_hex(0xAAAAAA), LV_PART_MAIN);
+        lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 32);
+
+        g_exit_hold_bar = lv_bar_create(g_exit_hold_overlay);
+        lv_obj_set_size(g_exit_hold_bar, 260, 6);
+        lv_obj_align(g_exit_hold_bar, LV_ALIGN_BOTTOM_MID, 0, -5);
+        lv_bar_set_range(g_exit_hold_bar, 0, kExitHoldMs);
+        lv_obj_set_style_bg_color(g_exit_hold_bar, lv_color_hex(0x333333), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(g_exit_hold_bar, lv_color_hex(0xE8AE46), LV_PART_INDICATOR);
+    }
+    lv_bar_set_value(g_exit_hold_bar, std::min(elapsed, kExitHoldMs), LV_ANIM_OFF);
+    if (elapsed >= kExitHoldMs) g_running = false;
+}
+
 void clear_screen()
 {
+    cancel_exit_hold();
     if (g_root) lv_obj_del(g_root);
     g_no_results_box = nullptr;
     g_error_overlay = nullptr;
@@ -929,6 +1000,7 @@ void move_console(int delta)
 
 void build_console_picker()
 {
+    g_file_history.clear();
     g_view = View::ConsolePicker;
     clear_screen();
     build_header();
@@ -963,7 +1035,11 @@ void build_console_picker()
     }
     for (int i = n; i < static_cast<int>(g_dots.size()); ++i) g_dots[i] = nullptr;
 
-    g_hint = nullptr;
+    g_hint = lv_label_create(g_root);
+    lv_label_set_text(g_hint, "Hold ESC 3s: home");
+    lv_obj_set_style_text_font(g_hint, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(g_hint, lv_color_hex(0x888888), LV_PART_MAIN);
+    lv_obj_align(g_hint, LV_ALIGN_BOTTOM_MID, 0, 0);
 
     refresh_carousel();
     update_time();
@@ -1067,7 +1143,7 @@ void render_file_rows()
 
     if (g_filter_label) {
         std::string text = g_filter.empty()
-            ? "type to filter | Fn+Z/F/X: letters"
+            ? "Type / Fn+Z/F/X | ESC: back"
             : ("#55CC66 o# #666666filter: " + g_filter + "#");
         lv_label_set_text(g_filter_label, text.c_str());
     }
@@ -1371,8 +1447,39 @@ void handle_key(unsigned raw_code)
         return;
     }
 
+    if (raw_code == KEY_ESC) {
+        if (g_core_prompt_overlay) {
+            if (!g_core_prompt_busy) dismiss_core_prompt();
+        } else if (g_error_overlay) {
+            dismiss_error_overlay();
+        } else if (g_view == View::Settings) {
+            if (g_capture_bind_index >= 0) {
+                g_capture_bind_index = -1;
+                render_settings_rows();
+            } else if (g_settings_page == SettingsPage::InputRemap) {
+                build_settings_menu(SettingsPage::Main);
+            } else {
+                build_console_picker();
+            }
+        } else if (g_view == View::FilePicker) {
+            if (g_file_history.empty()) {
+                build_console_picker();
+            } else {
+                const FilePickerState previous = g_file_history.back();
+                g_file_history.pop_back();
+                g_rom_dir = previous.directory;
+                g_filter = previous.filter;
+                g_file_index = previous.index;
+                build_file_picker();
+            }
+        }
+        return;
+    }
+    // Changing context must never turn an already-held key into a quit gesture.
+    cancel_exit_hold();
+
     if (g_view == View::Settings && g_capture_bind_index >= 0) {
-        if (raw_code == KEY_BACKSPACE || raw_code == KEY_ESC) {
+        if (raw_code == KEY_BACKSPACE) {
             g_capture_bind_index = -1;
             render_settings_rows();
             return;
@@ -1390,7 +1497,7 @@ void handle_key(unsigned raw_code)
             return;
         }
 
-        if (raw_code <= KEY_MAX && raw_code != KEY_Q && raw_code != KEY_ESC) {
+        if (raw_code <= KEY_MAX) {
             g_app_config.binds[static_cast<size_t>(g_capture_bind_index)] = static_cast<int>(raw_code);
             g_capture_bind_index = -1;
             persist_and_apply_app_config(g_app_config);
@@ -1473,11 +1580,6 @@ void handle_key(unsigned raw_code)
 
     if (g_error_overlay) {
         dismiss_error_overlay();
-        return;
-    }
-
-    if (raw_code == KEY_ESC || (raw_code == KEY_Q && g_view != View::FilePicker)) {
-        g_running = false;
         return;
     }
 
@@ -1652,6 +1754,7 @@ void handle_key(unsigned raw_code)
             if (entry.path == "/") {
                 build_console_picker();
             } else {
+                g_file_history.push_back({g_rom_dir, g_filter, g_file_index});
                 g_rom_dir = entry.path;
                 g_filter.clear();
                 g_file_index = 0;
@@ -1688,8 +1791,16 @@ void poll_input()
     };
 
     input_event ev {};
-    for (int fd : g_input_fds) {
-        while (read(fd, &ev, sizeof(ev)) == sizeof(ev)) {
+    for (auto it = g_input_fds.begin(); it != g_input_fds.end();) {
+        const int fd = *it;
+        ssize_t bytes;
+        while ((bytes = read(fd, &ev, sizeof(ev))) == sizeof(ev)) {
+            const bool at_root = can_exit_from_root();
+            const bool escape_pressed = g_escape_hold.handle_event(fd, ev, lv_tick_get(), at_root);
+            if (ev.type == EV_KEY && ev.code == KEY_ESC) {
+                if (escape_pressed && !at_root) handle_key(KEY_ESC);
+                continue;
+            }
             if (ev.type != EV_KEY || ev.code > KEY_MAX) continue;
 
             if (ev.value == 0) {
@@ -1716,6 +1827,13 @@ void poll_input()
                 }
             }
         }
+        if (bytes == 0 || (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+            g_escape_hold.disconnect(fd);
+            close(fd);
+            it = g_input_fds.erase(it);
+        } else {
+            ++it;
+        }
     }
 
     uint32_t now = lv_tick_get();
@@ -1730,6 +1848,7 @@ void poll_input()
             return;
         }
     }
+    update_exit_hold();
 }
 
 }
@@ -1747,6 +1866,8 @@ bool run_app_ui(std::string &core_path, std::string &rom_path)
     g_selected_rom.clear();
     g_filter.clear();
     g_input_fds.clear();
+    g_escape_hold.reset();
+    g_file_history.clear();
     g_nav_key_down.fill(0);
     g_nav_key_next_ms.fill(0);
     g_error_overlay = nullptr;
@@ -1798,6 +1919,8 @@ bool run_app_ui(std::string &core_path, std::string &rom_path)
     for (int fd : g_input_fds) close(fd);
     g_input_fds.clear();
 
+    cancel_exit_hold();
+    g_escape_hold.reset();
     if (g_root) {
         lv_obj_del(g_root);
         g_root = nullptr;

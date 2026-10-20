@@ -268,8 +268,8 @@ void draw_launch_controls_screen(
     lv_obj_set_style_text_font(selsta, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     lv_obj_t *quit_hint = lv_label_create(pad);
-    lv_label_set_text(quit_hint, "Quit=TAB");
-    lv_obj_align(quit_hint, LV_ALIGN_BOTTOM_RIGHT, -8, -6);
+    lv_label_set_text(quit_hint, "Exit: hold ESC 1s");
+    lv_obj_align(quit_hint, LV_ALIGN_BOTTOM_RIGHT, -8, compact ? -22 : -6);
     lv_obj_set_style_text_color(quit_hint, lv_color_hex(0x9A9AA5), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(quit_hint, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
 

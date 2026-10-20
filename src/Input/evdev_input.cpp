@@ -189,6 +189,8 @@ void EvdevInput::init_key_bindings()
 // Opens Linux evdev devices used by the Cardputer Zero keyboard/buttons.
 bool EvdevInput::init()
 {
+    escape_hold_.reset();
+    return_to_ui_requests_ = 0;
     init_key_bindings();
 
     for (int i = 0; i < 32; ++i) {
@@ -215,6 +217,8 @@ void EvdevInput::shutdown()
         close(fd);
     }
     fds_.clear();
+    escape_hold_.reset();
+    return_to_ui_requests_ = 0;
 }
 
 void EvdevInput::handle_keyboard_event(int code, int value)
@@ -238,24 +242,25 @@ void EvdevInput::handle_keyboard_event(int code, int value)
 // Reads pending input events and updates frontend/core state.
 void EvdevInput::poll()
 {
+    constexpr uint32_t kExitHoldMs = 1000;
     constexpr uint64_t kVolumeInitialDelayMs = 260;
     constexpr uint64_t kVolumeRepeatMs = 60;
     constexpr uint64_t kBrightnessInitialDelayMs = 260;
     constexpr uint64_t kBrightnessRepeatMs = 60;
 
     input_event ev {};
-    for (int fd : fds_) {
-        while (read(fd, &ev, sizeof(ev)) == sizeof(ev)) {
+    for (auto it = fds_.begin(); it != fds_.end();) {
+        const int fd = *it;
+        ssize_t bytes;
+        while ((bytes = read(fd, &ev, sizeof(ev))) == sizeof(ev)) {
+            const uint64_t now_ms = monotonic_ms();
+            escape_hold_.handle_event(fd, ev, static_cast<uint32_t>(now_ms), true);
+            if (ev.type == EV_KEY && ev.code == KEY_ESC) continue;
             if (ev.type != EV_KEY) {
                 continue;
             }
 
-            const uint64_t now_ms = monotonic_ms();
             handle_keyboard_event(ev.code, ev.value);
-
-            if ((ev.code == KEY_Q || ev.code == KEY_ESC) && ev.value != 0) {
-                quit_ = true;
-            }
 
             int id = -1;
             if (static_cast<size_t>(ev.code) < key_to_joypad_.size()) {
@@ -330,17 +335,21 @@ void EvdevInput::poll()
                 }
                 continue;
             }
-            if (ev.code == KEY_TAB) {
-                if (ev.value == 1) {
-                    ++return_to_ui_requests_;
-                }
-                continue;
-            }
-
+        }
+        if (bytes == 0 || (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+            escape_hold_.disconnect(fd);
+            close(fd);
+            it = fds_.erase(it);
+        } else {
+            ++it;
         }
     }
 
     const uint64_t now_ms = monotonic_ms();
+    if (escape_hold_.active() && escape_hold_.elapsed(static_cast<uint32_t>(now_ms)) >= kExitHoldMs) {
+        ++return_to_ui_requests_;
+        escape_hold_.cancel(); // Only one exit request until ESC is released.
+    }
     while (volume_up_held_ && now_ms >= volume_up_next_repeat_ms_) {
         ++volume_steps_;
         volume_up_next_repeat_ms_ += kVolumeRepeatMs;
